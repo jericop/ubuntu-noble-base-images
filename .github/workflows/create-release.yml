@@ -2,7 +2,7 @@ name: Create Release
 
 on:
   schedule:
-    - cron: '27 2,14 * * *'  # daily at 02:27 and 14:27 UTC
+    - cron: '36 0,12 * * *'  # daily at 00:36 and 12:36 UTC
   push:
     branches:
     - main
@@ -24,6 +24,7 @@ concurrency: release
 env:
   STACKS_FILEPATH: "images.json"
   PATCHED_USNS_FILENAME: "patched-usns.json"
+  USNS_NOTICES_ARTIFACT: "usns-notices"
 jobs:
   preparation:
     name: Preparation
@@ -44,7 +45,7 @@ jobs:
       support_usns: ${{ steps.polling-os-type.outputs.support_usns }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # gets full history
 
@@ -109,7 +110,8 @@ jobs:
               is_new,
               stack_type,
               pattern_image_registry_name,
-              pattern_assets_prefix
+              pattern_assets_prefix,
+              no_stack_id
             })')
 
           stacks=$(jq -c <<< "$stacks" )
@@ -205,13 +207,31 @@ jobs:
           echo "platforms=$platforms"
           echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
 
+  download_usns:
+    name: Download USNs
+    runs-on: ubuntu-24.04
+    needs: [preparation]
+    if: ${{ needs.preparation.outputs.polling_type == 'usn' }}
+    steps:
+      - name: Download latest USNs
+        uses: paketo-buildpacks/github-config/actions/stack/download-latest-usns@main
+        with:
+          distro: ${{ needs.preparation.outputs.os_codename }}
+          usns-output-path: "${{ github.workspace }}/${{ env.USNS_NOTICES_ARTIFACT }}.json"
+
+      - name: Upload USNs notices
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.USNS_NOTICES_ARTIFACT }}
+          path: "${{ github.workspace }}/${{ env.USNS_NOTICES_ARTIFACT }}.json"
+
   # The following job is specific to Ubuntu images. It checks for new
   # USNs (Ubuntu Security Notices) and triggers the flow to create
   # a new release with the latest images that have the USNs patched.
   poll_usns:
     name: Poll USNs
     runs-on: ubuntu-24.04
-    needs: [preparation]
+    needs: [preparation, download_usns]
     if: ${{ needs.preparation.outputs.polling_type == 'usn' }}
     strategy:
       matrix:
@@ -220,6 +240,11 @@ jobs:
     outputs:
       usns: ${{ steps.new_usns.outputs.usns }}
     steps:
+    - name: Download USNs notices
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ env.USNS_NOTICES_ARTIFACT }}
+
     - name: Check for Previous Releases
       id: check_previous
       run: |
@@ -322,6 +347,12 @@ jobs:
         run_receipt: "${{ github.workspace }}/${{ matrix.arch.name }}-previous-run-receipt-${{ matrix.stacks.name }}"
         output_path: "${{ github.workspace }}/${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
 
+    - name: Upload package list file
+      uses: actions/upload-artifact@v4
+      with:
+        name: "${{ matrix.arch.name }}-${{ matrix.stacks.name }}-package-list.json"
+        path: "${{ github.workspace }}/${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
+
     - name: Generate USNs download asset pattern
       id: usn_download_pattern
       run: |
@@ -379,6 +410,7 @@ jobs:
       uses: paketo-buildpacks/github-config/actions/stack/get-usns@main
       with:
         distribution: ${{ needs.preparation.outputs.os_codename }}
+        api_url: "file:///github/workspace/${{ env.USNS_NOTICES_ARTIFACT }}.json"
         packages_filepath: "./${{ matrix.arch.name }}-package-list-${{ matrix.stacks.name }}"
         last_usns_filepath: "./${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}-previous"
         usns_output_path: "./${{ matrix.arch.name }}-${{ matrix.stacks.name }}-${{ env.PATCHED_USNS_FILENAME }}"
@@ -408,6 +440,7 @@ jobs:
     if: ${{ needs.preparation.outputs.polling_type == 'hash' }}
     needs: preparation
     strategy:
+      max-parallel: 2
       matrix:
         stacks: ${{ fromJSON(needs.preparation.outputs.stacks) }}
         arch: ${{ fromJSON(needs.preparation.outputs.architectures) }}
@@ -418,6 +451,7 @@ jobs:
       id: hashcode_pattern
       run: |
         os_codename="${{ needs.preparation.outputs.os_codename }}"
+        os_name="${{ needs.preparation.outputs.os_name }}"
         stack_type="${{ matrix.stacks.stack_type }}"
         repo_type="${{ needs.preparation.outputs.repo_type }}"
         build_image="${{ matrix.stacks.build_image }}"
@@ -429,11 +463,17 @@ jobs:
           if [[ "$pattern_assets_prefix" == "os_codename-stack_type-repo_type-version-arch-build_image_run_image" ]]; then
             build="${os_codename}-${stack_type}-${repo_type}-\\d+.\\d+(.\\d+)?-${build_image}.oci.sha256"
             run="${os_codename}-${stack_type}-${repo_type}-\\d+.\\d+(.\\d+)?-${run_image}.oci.sha256"
+          elif [[ "$pattern_assets_prefix" == "os_name-os_codename-build_image_run_image-stack_type-version-arch" ]]; then
+            build="${os_name}-${os_codename}-${build_image}-${stack_type}-\\d+\\.\\d+(\\.\\d+)?.oci.sha256"
+            run="${os_name}-${os_codename}-${run_image}-${stack_type}-\\d+\\.\\d+(\\.\\d+)?.oci.sha256"
           fi
         else
           if [[ "$pattern_assets_prefix" == "os_codename-stack_type-repo_type-version-arch-build_image_run_image" ]]; then
             build="${os_codename}-${stack_type}-${repo_type}-\\d+.\\d+(.\\d+)?-${arch}-${build_image}.oci.sha256"
             run="${os_codename}-${stack_type}-${repo_type}-\\d+.\\d+(.\\d+)?-${arch}-${run_image}.oci.sha256"
+          elif [[ "$pattern_assets_prefix" == "os_name-os_codename-build_image_run_image-stack_type-version-arch" ]]; then
+            build="${os_name}-${os_codename}-${build_image}-${stack_type}-\\d+\\.\\d+(\\.\\d+)?-${arch}.oci.sha256"
+            run="${os_name}-${os_codename}-${run_image}-${stack_type}-\\d+\\.\\d+(\\.\\d+)?-${arch}.oci.sha256"
           fi
         fi
 
@@ -523,7 +563,7 @@ jobs:
       stack_files_changed: ${{ steps.compare.outputs.stack_files_changed }}
     steps:
     - name: Checkout With History
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0  # gets full history
 
@@ -589,17 +629,26 @@ jobs:
         stacks: ${{ fromJSON(needs.preparation.outputs.stacks) }}
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     # https://github.com/docker/setup-qemu-action
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
+      uses: docker/setup-qemu-action@v4
 
     - name: Create stack ${{ matrix.stacks.name }}
       id: create-stack
       run: |
-        scripts/create.sh --stack-dir ${{ matrix.stacks.config_dir }} \
-                          --build-dir ${{ matrix.stacks.output_dir }}
+
+        args=(
+            --stack-dir ${{ matrix.stacks.config_dir }}
+            --build-dir ${{ matrix.stacks.output_dir }}
+          )
+
+        if [[ "${{ matrix.stacks.no_stack_id }}" == "true" ]]; then
+          args+=("--no-stack-id")
+        fi
+
+        scripts/create.sh "${args[@]}"
 
     - name: Generate Package Receipts
       id: receipts
@@ -660,7 +709,7 @@ jobs:
         arch: ${{ fromJSON(needs.preparation.outputs.architectures) }}
     steps:
     - name: Checkout With History
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0  # gets full history
 
@@ -686,7 +735,7 @@ jobs:
     - name: Write Empty Previous Receipts
       if: ${{ steps.check_previous.outputs.exists == 'false' || matrix.arch.is_new == true || matrix.stacks.is_new == true }}
       run: |
-        if [ ${{ matrix.stacks.create_build_image }} == true ]; then
+        if [ "${{ matrix.stacks.create_build_image }}" == "true" ]; then
           if [ ! -f "./${{ matrix.arch.name }}-previous-build-receipt-${{ matrix.stacks.name }}" ]; then
             echo '{"components":[]}' > "./${{ matrix.arch.name }}-previous-build-receipt-${{ matrix.stacks.name }}"
           fi
@@ -898,7 +947,7 @@ jobs:
         echo "run_image=${run_image}" >> "$GITHUB_OUTPUT"
 
     - name: Create Release Notes per Arch and per Stack
-      id: notes_arc_stack
+      id: notes_arch_stack
       uses: paketo-buildpacks/github-config/actions/stack/release-notes@main
       with:
         build_image: ${{ steps.registry_names.outputs.build_image }}
@@ -910,7 +959,7 @@ jobs:
         run_packages_modified: "/github/workspace/${{ env.RUN_DIFF_MODIFIED_FILENAME }}"
         run_packages_removed_with_force: "/github/workspace/${{ env.RUN_DIFF_REMOVED_FILENAME }}"
         supports_usns: ${{ needs.preparation.outputs.support_usns }}
-        patched_usns: ${{ needs.get-usns.outputs.usns }}
+        patched_usns: ${{ steps.get-usns.outputs.usns }}
         release_body_file: "${{ matrix.arch.name }}-${{ matrix.stacks.name }}-release-notes.md"
 
     - name: Upload ${{ matrix.arch.name }} release notes file for stack ${{ matrix.stacks.name }}
@@ -961,7 +1010,7 @@ jobs:
 
         if [ "${build_added:-0}" -eq 0 ] && [ "${build_modified:-0}" -eq 0 ] && [ "${run_added}" -eq 0 ] && [ "${run_modified}" -eq 0 ]; then
           echo "No packages changed."
-          # We ommit setting "packages_changed" variable to false,
+          # We omit setting "packages_changed" variable to false,
           # as there is an edge case scenario overriding any true value due to parallelization
         else
           echo "Packages changed."
@@ -974,13 +1023,13 @@ jobs:
     if: ${{ !cancelled() && !failure() && needs.create_stack.result != 'skipped' }}
     runs-on: ubuntu-24.04
     steps:
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: stable
-
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
+
+    - name: Setup Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: go.mod
 
     - name: Download Build Image(s)
       uses: actions/download-artifact@v4
@@ -1026,7 +1075,7 @@ jobs:
         printf "Force Release: %s\n" "${{ github.event.inputs.force }}"
 
     - name: Checkout With History
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         fetch-depth: 0  # gets full history
 
@@ -1187,56 +1236,54 @@ jobs:
             create_build_image=$(echo "$stack" | jq -r '.create_build_image // false')
             stack_type=$(echo "$stack" | jq -r '.stack_type // ""')
             pattern_assets_prefix=$(echo "$stack" | jq -r '.pattern_assets_prefix // ""')
+            version="${{ steps.tag.outputs.tag }}"
 
             for arch in $archs; do
               arch_name=$(echo "$arch" | jq -r '.name')
-              arch_prefix="-${arch_name}-"
+              arch_prefix="${arch_name}"
               if [[ $arch_name == "amd64" ]]; then
-                arch_prefix="-"
+                arch_prefix=""
               fi
 
               # hash code for the run image
               run_image=$(echo "$stack" | jq -r '.run_image')
+              build_image=$(echo "$stack" | jq -r '.build_image')
               if [[ "$pattern_assets_prefix" == "os_codename-stack_type-repo_type-version-arch-build_image_run_image" ]]; then
-                asset_prefix="${os_codename}-${stack_type}-${repo_type}-${version}"
+                asset_prefix_run_image=$( echo '[ "'"$os_codename"'", "'"$stack_type"'", "'"$repo_type"'", "'"$version"'",
+                "'"$arch_prefix"'", "'"$run_image"'"]' | jq -r 'map(select(length > 0)) | join("-")' )
+                asset_prefix_build_image=$( echo '[ "'"$os_codename"'", "'"$stack_type"'", "'"$repo_type"'", "'"$version"'",
+                "'"$arch_prefix"'", "'"$build_image"'"]' | jq -r 'map(select(length > 0)) | join("-")' )
+              elif [[ "$pattern_assets_prefix" == "os_name-os_codename-build_image_run_image-stack_type-version-arch" ]]; then
+                asset_prefix_run_image=$( echo '[ "'"$os_name"'", "'"$os_codename"'", "'"$run_image"'", "'"$stack_type"'",
+                "'"$version"'", "'"$arch_prefix"'"]' | jq -r 'map(select(length > 0)) | join("-")' )
+                asset_prefix_build_image=$( echo '[ "'"$os_name"'", "'"$os_codename"'", "'"$build_image"'", "'"$stack_type"'",
+                "'"$version"'", "'"$arch_prefix"'"]' | jq -r 'map(select(length > 0)) | join("-")' )
               fi
 
-              run_image=$(echo "$stack" | jq -r '.run_image')
               assets="$(jq -c \
                 --arg hash_code_filepath "hash-code-files" \
                 --arg stack_name "${stack_name}" \
-                --arg run_image "${run_image}" \
-                --arg asset_prefix "$asset_prefix" \
+                --arg asset_prefix "${asset_prefix_run_image}" \
                 --arg arch "${arch_name}" \
-                --arg arch_prefix "${arch_prefix}" \
                 '. += [
                   {
                     "path": ($hash_code_filepath + "/" + "hash-code-current-run-image-"+ $arch + "-" + $stack_name ),
-                    "name": ($asset_prefix + $arch_prefix + $run_image + ".oci.sha256"),
+                    "name": ($asset_prefix + ".oci.sha256"),
                     "content_type": "text/plain"
                   }
                 ]' <<<"${assets}")"
 
               # hash code for the build image
-              if [[ $create_build_image == true ]]; then
-
-                build_image=$(echo "$stack" | jq -r '.build_image')
-                if [[ "$pattern_assets_prefix" == "os_codename-stack_type-repo_type-version-arch-build_image_run_image" ]]; then
-                  asset_prefix="${os_codename}-${stack_type}-${repo_type}-${version}"
-                fi
-
-                build_image=$(echo "$stack" | jq -r '.build_image')
+              if [[ "$create_build_image" == "true" ]]; then
                 assets="$(jq -c \
                   --arg hash_code_filepath "hash-code-files" \
                   --arg stack_name "${stack_name}" \
-                  --arg build_image "${build_image}" \
-                  --arg asset_prefix "$asset_prefix" \
+                  --arg asset_prefix "${asset_prefix_build_image}" \
                   --arg arch "${arch_name}" \
-                  --arg arch_prefix "${arch_prefix}" \
                   '. += [
                     {
                       "path": ($hash_code_filepath + "/" + "hash-code-current-build-image-"+ $arch + "-" + $stack_name ),
-                      "name": ($asset_prefix + $arch_prefix + $build_image + ".oci.sha256"),
+                      "name": ($asset_prefix + ".oci.sha256"),
                       "content_type": "text/plain"
                     }
                   ]' <<<"${assets}")"
@@ -1261,6 +1308,7 @@ jobs:
 
             # SBOM for the run image
             run_image=$(echo "$stack" | jq -r '.run_image')
+            build_image=$(echo "$stack" | jq -r '.build_image')
             if [[ "$pattern_assets_prefix" == "os_name-os_codename-build_image_run_image-stack_type-version-arch" ]]; then
               sbom_asset_name_run_image=$( echo '[ "'"$os_name"'", "'"$os_codename"'", "'"$run_image"'", "'"$stack_type"'",
               "'"$version"'", "'"$arch_prefix"'", "receipt.cyclonedx.json" ]' | jq -r 'map(select(length > 0)) | join("-")' )
